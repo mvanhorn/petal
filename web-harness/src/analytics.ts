@@ -311,9 +311,10 @@ function send(body: Record<string, unknown>): void {
 }
 
 /**
- * THE single consent check for every PostHog send (web). #377 points this at
- * its usage-stats toggle; until then it is always true (default on, matching
- * Sentry). Do not add a second check elsewhere (#370/#377).
+ * THE single consent check for every PostHog send (web). Once #377 (PR #386)
+ * lands, this body becomes `return usageStatsEnabled();` from
+ * `@petal/shared/logic/usageStats`; until then it is always true (default on,
+ * matching Sentry). Do not add a second check or a toggle here (#370/#377).
  */
 export function usageStatsConsented(): boolean {
   if (testConsent !== null) return testConsent;

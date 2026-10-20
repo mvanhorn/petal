@@ -1074,9 +1074,10 @@ fn enqueue(tx: &tokio::sync::mpsc::Sender<serde_json::Value>, body: serde_json::
     }
 }
 
-/// THE single consent check for every PostHog send (native). #377 points this
-/// at its usage-stats toggle; until then it is always true (default on,
-/// matching Sentry). Do not add a second check elsewhere (#370/#377).
+/// THE single consent check for every PostHog send (native). Once #377 (PR
+/// #386) lands, this body becomes the one line `usage_stats_enabled()`;
+/// until then it is always true (default on, matching Sentry). Do not add a
+/// second check or a toggle here (#370/#377).
 fn usage_stats_consented() -> bool {
     #[cfg(test)]
     if let Some(consented) = TEST_CONSENT.with(std::cell::Cell::get) {

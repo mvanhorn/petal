@@ -125,7 +125,8 @@ Counters and dimensions appear only once a producer reports them. Histograms
 are fixed log-spaced buckets (about 5%) over 0-5000 ms; percentiles are
 nearest-rank. Every send passes the single consent check
 (`analytics.rs` `usage_stats_consented`, `analytics.ts`
-`usageStatsConsented`) that #377 connects to the usage-stats toggle.
+`usageStatsConsented`), which delegates to #377's `usage_stats_enabled()` /
+`usageStatsEnabled()` once that lands.
 
 Sentry gets one closed-tag diagnostic, `remote-control-latency-degraded`
 (native only), when an interval has `photon_ms_p95 > 400` or
