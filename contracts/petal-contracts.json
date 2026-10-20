@@ -2595,19 +2595,6 @@
       "receive_to_present_ms",
       "photon_ms"
     ],
-    "counters": [
-      "input_stall_count",
-      "frames_dropped",
-      "freeze_count",
-      "nack_count",
-      "pli_count",
-      "packets_lost_pct_x100",
-      "offset_err_ms"
-    ],
-    "maxCounters": [
-      "packets_lost_pct_x100",
-      "offset_err_ms"
-    ],
     "dimensions": {
       "lk_region": null,
       "same_edge": [
@@ -2652,8 +2639,7 @@
       "final"
     ],
     "roles": [
-      "host",
-      "controller"
+      "host"
     ],
     "stageSuffixes": [
       "_p50",
@@ -2664,10 +2650,6 @@
     "intervalMs": 60000,
     "finalMinSamples": 5,
     "maxEventsPerSession": 120,
-    "degraded": {
-      "photonP95AboveMs": 400,
-      "inputStallCountAtLeast": 5
-    },
     "logPrefix": "remote-control-latency-summary:",
     "example": {
       "summary": {
@@ -2689,9 +2671,6 @@
             "n": 398
           }
         },
-        "counters": {
-          "input_stall_count": 2
-        },
         "dimensions": {
           "window_codec": "h264"
         }
@@ -2709,10 +2688,9 @@
         "replay_complete_ms_p95": 108,
         "replay_complete_ms_max": 240,
         "replay_complete_ms_n": 398,
-        "input_stall_count": 2,
         "window_codec": "h264"
       },
-      "logLine": "remote-control-latency-summary: role=host rc_session_id=0123456789abcdef0123456789abcdef interval_s=60 final=false replay_inject_ms_p50=3 replay_inject_ms_p95=9 replay_inject_ms_max=20 replay_inject_ms_n=400 replay_complete_ms_p50=5 replay_complete_ms_p95=108 replay_complete_ms_max=240 replay_complete_ms_n=398 input_stall_count=2 window_codec=h264"
+      "logLine": "remote-control-latency-summary: role=host rc_session_id=0123456789abcdef0123456789abcdef interval_s=60 final=false replay_inject_ms_p50=3 replay_inject_ms_p95=9 replay_inject_ms_max=20 replay_inject_ms_n=400 replay_complete_ms_p50=5 replay_complete_ms_p95=108 replay_complete_ms_max=240 replay_complete_ms_n=398 window_codec=h264"
     }
   },
   "aiTracks": [

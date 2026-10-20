@@ -901,23 +901,6 @@ fn hot_path_capable_targets() -> &'static Mutex<HashSet<(u32, String)>> {
     remote_control_engine().hot_path_capable_targets()
 }
 
-/// #370: (window, host) pairs this process is currently controlling, from
-/// the host's own active/stopped status. Drives the controller-side latency
-/// session; cleared on leave by `revoke_all`.
-fn controller_active_targets() -> &'static Mutex<HashSet<(u32, String)>> {
-    static TARGETS: OnceLock<Mutex<HashSet<(u32, String)>>> = OnceLock::new();
-    TARGETS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-fn note_controller_control_active(window_id: u32, host_identity: &str, active: bool) {
-    let mut targets = controller_active_targets().lock_unpoisoned();
-    if active {
-        targets.insert((window_id, host_identity.to_string()));
-    } else {
-        targets.remove(&(window_id, host_identity.to_string()));
-    }
-}
-
 fn new_grant_token() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable for remote-control grant token");
@@ -1456,12 +1439,10 @@ fn ensure_pressed_ttl_sweeper() {
             std::thread::sleep(HELD_INPUT_SWEEP_INTERVAL);
             let releases = drain_expired_pressed(Instant::now());
             enqueue_synthetic_releases(releases, "held input TTL expired");
-            // #370: reconcile both latency-summary sessions with the live
+            // #370: reconcile the host latency-summary session with the live
             // grant state (authority, not event order) and emit due intervals.
             let hosting = !sessions().lock_unpoisoned().is_empty();
             rc_latency_telemetry::sync(RcRole::Host, hosting);
-            let controlling = !controller_active_targets().lock_unpoisoned().is_empty();
-            rc_latency_telemetry::sync(RcRole::Controller, controlling);
             ticks_since_summary += 1;
             if ticks_since_summary >= LATENCY_SUMMARY_TICK_INTERVAL {
                 ticks_since_summary = 0;
@@ -1781,8 +1762,6 @@ pub(crate) fn revoke_all(app: &AppHandle) {
     warned_controller_id_mismatches().lock_unpoisoned().clear();
     // Refs #288: same insert-only leak class as the maps above.
     *discrete_admissions().lock_unpoisoned() = DiscreteAdmissionState::default();
-    // #370: leaving the room ends any controller-side latency session too.
-    controller_active_targets().lock_unpoisoned().clear();
     for (window_id, controller_id) in active {
         emit_status(
             app,
@@ -4632,7 +4611,6 @@ fn handle_message(
             #[cfg(not(target_os = "windows"))]
             let overlay_active = Some(status == "active");
             if let Some(active) = overlay_active {
-                note_controller_control_active(message.window_id, &message.controller_id, active);
                 if let Err(e) = set_remote_window_control_active(
                     app,
                     message.window_id,

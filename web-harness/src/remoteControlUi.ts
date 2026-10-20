@@ -25,8 +25,6 @@ import {
   nextLocalEchoRippleId,
   type EchoPoint,
 } from '@petal/shared/logic/localEcho';
-import { RcLatencyAggregator, rcLatencySummaryLogLine } from '@petal/shared/logic/rcLatencyAggregator';
-import { remoteControlLatencySummary } from './analytics.ts';
 
 const remoteControlEncoder = new TextEncoder();
 
@@ -63,19 +61,6 @@ export function setupRemoteControlUi(ctx: HarnessContext) {
   }>();
   const resultFeedbackTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const pendingDiscreteTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  // #370: controller-side latency summary. Reconciled every second against the
-  // live grant (authority, not event order), so every stop path -- release,
-  // revoke, leave -- ends the session. Producers (#371/#375/#376) use `rcLatency`.
-  const rcLatency = new RcLatencyAggregator('controller', {
-    emit: (summary) => {
-      logEvent(rcLatencySummaryLogLine(summary));
-      remoteControlLatencySummary(summary);
-    }
-  });
-  const rcLatencyTimer = setInterval(() => {
-    rcLatency.sync(Boolean(state.activeRemoteControl?.grantToken), Date.now());
-  }, 1000);
-  (rcLatencyTimer as { unref?: () => void }).unref?.();
 
   function nextRemoteControlSeq(): number {
     state.remoteControlSeq =
@@ -1126,7 +1111,6 @@ export function setupRemoteControlUi(ctx: HarnessContext) {
     ensureRemoteControlAffordance,
     // shared primitives for harnessApi.ts
     nextRemoteControlSeq,
-    rcLatency,
     remoteControlTargetFromTile,
     publishRemoteControl,
   };

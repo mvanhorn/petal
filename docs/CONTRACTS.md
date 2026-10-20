@@ -1374,28 +1374,28 @@ Files to change together:
 
 ## Remote-control latency summary (#370)
 
-Not a wire format: neither client sends it to the other. It is pinned here
-because both clients emit the same PostHog event and log line from the same
-schema, and the release-gate verdict parses the line.
+Not a wire format: no client sends it to another. It is pinned here because
+the PostHog event and the log line follow one schema, the release-gate
+verdict parses the line, and the web client must reproduce it when it gains
+a producer (#375).
 
 - `latencyHistogramVectors`: inputs and expected `n`/`rejected`/`p50`/`p95`/
-  `max` for the shared histogram (`shared/logic/latencyHistogram.ts`, Rust
-  `rc_latency_telemetry.rs`). Buckets are `[0, 1)` then edges built by
-  repeated `*= 1.05` up to 5000 ms (176 buckets); values above 5000 clamp,
-  negatives and non-finite values are rejected and counted. Percentiles are
-  nearest-rank `ceil(n*p) - 1`, reported as the bucket's geometric midpoint
-  clamped to the observed min/max and rounded. A `null` sample means NaN.
-- `remoteControlLatencySummary`: the closed stage, counter and dimension
-  keys (in emission order), the cadence (60 s interval, final partial at
-  n >= 5, 120 events per session cap), the degraded thresholds and an
-  `example` summary with its exact properties and
-  `remote-control-latency-summary:` log line.
+  `max` for the histogram in `rc_latency_telemetry.rs`. Buckets are `[0, 1)`
+  then edges built by repeated `*= 1.05` up to 5000 ms (176 buckets); values
+  above 5000 clamp, negatives and non-finite values are rejected and
+  counted. Percentiles are nearest-rank `ceil(n*p) - 1`, reported as the
+  bucket's geometric midpoint clamped to the observed min/max and rounded.
+  A `null` sample means NaN. The TS mirror (#375) must pass the same vectors.
+- `remoteControlLatencySummary`: the closed stage and dimension keys (in
+  emission order), the roles measured today, the cadence (60 s interval,
+  final partial at n >= 5, 120 events per session cap, empty intervals never
+  emit) and an `example` summary with its exact properties and
+  `remote-control-latency-summary:` log line. Counters (#371) and the
+  degraded thresholds (#371/#376) are added here with their producers.
 
-Both test suites (`rc_latency_telemetry::tests`,
-`web-harness/tests/rcLatencyAggregator.test.ts`) assert against this entry.
-No wire field changed in #370, so there is no old-peer fixture; the
-`telemetrySessionId` status field from #369's design is not added yet (each
-side mints its own `rc_session_id`).
+No wire field changed in #370, so there is no old-peer fixture. The
+`telemetrySessionId` status field from #369's design is not added yet; the
+host mints its own `rc_session_id`.
 
 ## Plugin registry
 

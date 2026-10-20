@@ -1407,7 +1407,6 @@ mod tests {
                 Stage::ReplayCompleteMs,
                 HistogramStats { p50: 4, p95: 108, max: 240, n: 400 },
             )],
-            counters: vec![],
             dimensions: vec![(Dimension::WindowCodec, "h264".to_string())],
         }
     }
@@ -1439,9 +1438,6 @@ mod tests {
             for suffix in schema["stageSuffixes"].as_array().unwrap() {
                 allowed.push(format!("{}{}", stage.as_str().unwrap(), suffix.as_str().unwrap()));
             }
-        }
-        for counter in schema["counters"].as_array().unwrap() {
-            allowed.push(counter.as_str().unwrap().to_string());
         }
         for dimension in schema["dimensions"].as_object().unwrap().keys() {
             allowed.push(dimension.clone());

@@ -1,17 +1,17 @@
 //! Per-control-session remote-control latency aggregator (#370, tracking #369).
 //!
-//! TS mirror: `shared/logic/latencyHistogram.ts` + `shared/logic/rcLatencyAggregator.ts`.
-//! Stage/counter/dimension keys, histogram vectors and the summary log line
-//! are pinned by `contracts/petal-contracts.json` (`latencyHistogramVectors`,
-//! `remoteControlLatencySummary`); change both languages together.
+//! Stage/dimension keys, histogram vectors and the summary log line are
+//! pinned by `contracts/petal-contracts.json` (`latencyHistogramVectors`,
+//! `remoteControlLatencySummary`). What lands with its first producer, not
+//! here: the TS mirror (#375), counters and the controller role (#371), the
+//! Sentry degraded diagnostic (#371/#376).
 //!
-//! Producers (#371-#376) call only [`record_stage`], [`add_counter`] and
-//! [`set_dimension`]. The owner calls [`sync`] on a timer with the current
-//! "is control active" truth. Each interval with data becomes one
-//! `remote_control_latency_summary` PostHog event, one
-//! `remote-control-latency-summary:` log line, and (when degraded) one
-//! rate-limited Sentry diagnostic. Integer-ms aggregates only: no identities,
-//! titles, coordinates or key data ever enter this module.
+//! Producers call only [`record_stage`] and [`set_dimension`]. The owner
+//! calls [`sync`] on a timer with the current "is control active" truth.
+//! Each interval with samples becomes one `remote_control_latency_summary`
+//! PostHog event and one `remote-control-latency-summary:` log line.
+//! Integer-ms aggregates only: no identities, titles, coordinates or key
+//! data ever enter this module.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, TryLockError};
@@ -23,12 +23,10 @@ pub(crate) const EMIT_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const FINAL_MIN_SAMPLES: u32 = 5;
 pub(crate) const MAX_EVENTS_PER_SESSION: u32 = 120;
 pub(crate) const LOG_PREFIX: &str = "remote-control-latency-summary:";
-const DEGRADED_PHOTON_P95_ABOVE_MS: u32 = 400;
-const DEGRADED_INPUT_STALLS_AT_LEAST: u64 = 5;
 
 /// Upper edges of every bucket; bucket `j` is `[edges[j-1], edges[j])` with
-/// `edges[-1] = 0`. Built by repeated multiplication so the layout is
-/// bit-identical to the TS mirror.
+/// `edges[-1] = 0`. Built by repeated multiplication (correctly rounded IEEE
+/// ops), so a TS mirror can reproduce the layout bit-for-bit.
 fn bucket_edges() -> &'static [f64] {
     static EDGES: OnceLock<Vec<f64>> = OnceLock::new();
     EDGES.get_or_init(|| {
@@ -151,17 +149,17 @@ impl LatencyHistogram {
     }
 }
 
+
+/// Only the host measures anything today; `Controller` arrives with #371.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RcRole {
     Host,
-    Controller,
 }
 
 impl RcRole {
     pub(crate) fn key(self) -> &'static str {
         match self {
             Self::Host => "host",
-            Self::Controller => "controller",
         }
     }
 }
@@ -203,27 +201,6 @@ closed_keys!(Stage {
     PhotonMs => "photon_ms",
 });
 
-closed_keys!(Counter {
-    InputStallCount => "input_stall_count",
-    FramesDropped => "frames_dropped",
-    FreezeCount => "freeze_count",
-    NackCount => "nack_count",
-    PliCount => "pli_count",
-    PacketsLostPctX100 => "packets_lost_pct_x100",
-    OffsetErrMs => "offset_err_ms",
-});
-
-// #370: counters are the producer API for #371 (input_stall_count) and
-// #374/#375 (receiver counters); no P7 stage is a counter, so the only
-// in-tree callers until then are the tests and the degraded threshold.
-#[cfg_attr(not(test), allow(dead_code))]
-impl Counter {
-    /// These two keep the interval maximum; every other counter is summed.
-    fn keeps_max(self) -> bool {
-        matches!(self, Self::PacketsLostPctX100 | Self::OffsetErrMs)
-    }
-}
-
 closed_keys!(Dimension {
     LkRegion => "lk_region",
     SameEdge => "same_edge",
@@ -233,6 +210,8 @@ closed_keys!(Dimension {
     WindowCodec => "window_codec",
     ContentChange => "content_change",
 });
+
+const DIMENSION_COUNT: usize = 7;
 
 impl Dimension {
     /// `None` = free-form token (lowercase `[a-z0-9_-]`, at most 32 chars).
@@ -260,9 +239,9 @@ impl Dimension {
     }
 }
 
-/// One emitted interval. `stages` holds only stages with n > 0; `counters`
-/// and `dimensions` only what a producer actually reported this session
-/// (missing data is omitted, never sent as 0).
+/// One emitted interval. `stages` holds only stages with n > 0;
+/// `dimensions` only what a producer actually set this session (missing
+/// data is omitted, never sent as 0 or a guess).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Summary {
     pub(crate) role: RcRole,
@@ -270,7 +249,6 @@ pub(crate) struct Summary {
     pub(crate) interval_s: u64,
     pub(crate) is_final: bool,
     pub(crate) stages: Vec<(Stage, HistogramStats)>,
-    pub(crate) counters: Vec<(Counter, u64)>,
     pub(crate) dimensions: Vec<(Dimension, String)>,
 }
 
@@ -294,9 +272,6 @@ impl Summary {
             out.push((format!("{key}_max"), stats.max.into()));
             out.push((format!("{key}_n"), stats.n.into()));
         }
-        for (counter, value) in &self.counters {
-            out.push((counter.key().to_string(), (*value).into()));
-        }
         for (dimension, value) in &self.dimensions {
             out.push((dimension.key().to_string(), value.clone().into()));
         }
@@ -316,40 +291,6 @@ impl Summary {
         }
         line
     }
-
-    fn stage(&self, stage: Stage) -> Option<HistogramStats> {
-        self.stages.iter().find(|(s, _)| *s == stage).map(|(_, stats)| *stats)
-    }
-
-    fn counter(&self, counter: Counter) -> Option<u64> {
-        self.counters.iter().find(|(c, _)| *c == counter).map(|(_, v)| *v)
-    }
-
-    fn dimension(&self, dimension: Dimension) -> Option<&str> {
-        self.dimensions
-            .iter()
-            .find(|(d, _)| *d == dimension)
-            .map(|(_, v)| v.as_str())
-    }
-
-    /// #369 thresholds: `photon_ms_p95 > 400` or `input_stall_count >= 5`.
-    pub(crate) fn is_degraded(&self) -> bool {
-        self.stage(Stage::PhotonMs)
-            .is_some_and(|stats| stats.p95 > DEGRADED_PHOTON_P95_ABOVE_MS)
-            || self
-                .counter(Counter::InputStallCount)
-                .is_some_and(|stalls| stalls >= DEGRADED_INPUT_STALLS_AT_LEAST)
-    }
-
-    /// The component stage with the largest p50 (photon is the total, so it
-    /// never dominates itself).
-    pub(crate) fn dominant_stage(&self) -> Option<Stage> {
-        self.stages
-            .iter()
-            .filter(|(stage, stats)| *stage != Stage::PhotonMs && stats.n > 0)
-            .max_by_key(|(_, stats)| stats.p50)
-            .map(|(stage, _)| *stage)
-    }
 }
 
 struct Session {
@@ -357,8 +298,7 @@ struct Session {
     interval_started_at: Instant,
     events_emitted: u32,
     stages: Vec<LatencyHistogram>,
-    counters: [Option<u64>; 7],
-    dimensions: [Option<String>; 7],
+    dimensions: [Option<String>; DIMENSION_COUNT],
 }
 
 impl Session {
@@ -368,39 +308,30 @@ impl Session {
             interval_started_at: now,
             events_emitted: 0,
             stages: Stage::ALL.iter().map(|_| LatencyHistogram::new()).collect(),
-            counters: [None; 7],
             dimensions: Default::default(),
         }
     }
 
-    /// Drain the current interval. `None` when it held no data or the
-    /// per-session cap is spent.
+    /// Drain the current interval. `None` when it held no samples (an empty
+    /// interval never emits or spends the cap) or the per-session cap is spent.
     fn take_interval(&mut self, role: RcRole, now: Instant, is_final: bool) -> Option<Summary> {
         let stages: Vec<(Stage, HistogramStats)> = Stage::ALL
             .iter()
             .filter_map(|stage| Some((*stage, self.stages[stage.index()].stats()?)))
             .collect();
-        let counters: Vec<(Counter, u64)> = Counter::ALL
-            .iter()
-            .filter_map(|counter| Some((*counter, self.counters[counter.index()]?)))
-            .collect();
-        let interval_s = (now.saturating_duration_since(self.interval_started_at).as_millis() as u64 + 500) / 1000;
+        let elapsed_ms = now.saturating_duration_since(self.interval_started_at).as_millis() as u64;
         self.interval_started_at = now;
         self.stages.iter_mut().for_each(LatencyHistogram::reset);
-        for value in self.counters.iter_mut().flatten() {
-            *value = 0;
-        }
-        if (stages.is_empty() && counters.is_empty()) || self.events_emitted >= MAX_EVENTS_PER_SESSION {
+        if stages.is_empty() || self.events_emitted >= MAX_EVENTS_PER_SESSION {
             return None;
         }
         self.events_emitted += 1;
         Some(Summary {
             role,
             rc_session_id: self.rc_session_id.clone(),
-            interval_s,
+            interval_s: (elapsed_ms + 500) / 1000,
             is_final,
             stages,
-            counters,
             dimensions: Dimension::ALL
                 .iter()
                 .filter_map(|d| Some((*d, self.dimensions[d.index()].clone()?)))
@@ -458,20 +389,8 @@ impl Aggregator {
         });
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn add_counter(&self, counter: Counter, n: u64) {
-        self.with_session_nonblocking(|session| {
-            let slot = &mut session.counters[counter.index()];
-            let previous = slot.unwrap_or(0);
-            *slot = Some(if counter.keeps_max() {
-                previous.max(n)
-            } else {
-                previous.saturating_add(n)
-            });
-        });
-    }
-
-    /// False for a value outside the dimension's closed set (old value kept).
+    /// False for a value outside the dimension's closed set (old value kept)
+    /// or when no session is active.
     pub(crate) fn set_dimension(&self, dimension: Dimension, value: &str) -> bool {
         if !dimension.value_allowed(value) {
             return false;
@@ -484,8 +403,8 @@ impl Aggregator {
         set
     }
 
-    /// Reconcile with the current control state. Returns the summaries that
-    /// became due (at most one); emission happens outside the lock.
+    /// Reconcile with the current control state. Returns the summary that
+    /// became due, if any; emission happens outside the lock.
     pub(crate) fn sync_at(&self, active: bool, now: Instant) -> Option<Summary> {
         let mut guard = self.session.lock().unwrap_or_else(|p| p.into_inner());
         match (active, guard.as_mut()) {
@@ -515,12 +434,10 @@ impl Aggregator {
 }
 
 static HOST: Aggregator = Aggregator::new(RcRole::Host);
-static CONTROLLER: Aggregator = Aggregator::new(RcRole::Controller);
 
 fn aggregator(role: RcRole) -> &'static Aggregator {
     match role {
         RcRole::Host => &HOST,
-        RcRole::Controller => &CONTROLLER,
     }
 }
 
@@ -528,14 +445,6 @@ fn aggregator(role: RcRole) -> &'static Aggregator {
 /// blocks and never allocates; dropped when no session is active.
 pub(crate) fn record_stage(role: RcRole, stage: Stage, ms: f64) {
     aggregator(role).record_stage(stage, ms);
-}
-
-/// Add to an interval counter (or raise its max, see `Counter::keeps_max`).
-/// First fed by #371 (`input_stall_count`) and #374/#375 (receiver counters);
-/// it already drives the degraded threshold below.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn add_counter(role: RcRole, counter: Counter, n: u64) {
-    aggregator(role).add_counter(counter, n);
 }
 
 /// Set a closed-value dimension for the rest of `role`'s session.
@@ -547,24 +456,8 @@ pub(crate) fn set_dimension(role: RcRole, dimension: Dimension, value: &str) -> 
 /// interval that became due. Called from the remote-control sweeper tick.
 pub(crate) fn sync(role: RcRole, active: bool) {
     if let Some(summary) = aggregator(role).sync_at(active, Instant::now()) {
-        emit(&summary);
-    }
-}
-
-fn emit(summary: &Summary) {
-    log::info!("{}", summary.log_line());
-    crate::analytics::remote_control_latency_summary(summary);
-    if summary.is_degraded() {
-        let diagnostic = crate::logging::RemoteControlLatencyDegradedDiagnostic::from_summary(summary);
-        log::info!(
-            "remote-control-latency-degraded: role={} dominant_stage={} rc_session_id={}",
-            summary.role.key(),
-            summary.dominant_stage().map(Stage::key).unwrap_or("none"),
-            summary.rc_session_id
-        );
-        crate::logging::capture_sentry_diagnostic(
-            crate::logging::SentryDiagnosticEvent::RemoteControlLatencyDegraded(diagnostic),
-        );
+        log::info!("{}", summary.log_line());
+        crate::analytics::remote_control_latency_summary(&summary);
     }
 }
 
@@ -572,12 +465,6 @@ fn emit(summary: &Summary) {
 #[cfg(test)]
 pub(crate) fn take_host_interval_for_test() -> Option<Summary> {
     HOST.sync_at(true, Instant::now() + EMIT_INTERVAL + Duration::from_secs(1))
-}
-
-/// Closed tag values for the Sentry diagnostic (`unknown` until #372 ships
-/// the edge/ICE dimensions).
-pub(crate) fn summary_dimension_or_unknown(summary: &Summary, dimension: Dimension) -> &str {
-    summary.dimension(dimension).unwrap_or("unknown")
 }
 
 #[cfg(test)]
@@ -613,23 +500,13 @@ mod tests {
     #[serde(rename_all = "camelCase")]
     struct SummaryContract {
         stages: Vec<String>,
-        counters: Vec<String>,
-        max_counters: Vec<String>,
         dimensions: serde_json::Map<String, serde_json::Value>,
         roles: Vec<String>,
         interval_ms: u64,
         final_min_samples: u32,
         max_events_per_session: u32,
-        degraded: Degraded,
         log_prefix: String,
         example: Example,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Degraded {
-        photon_p95_above_ms: u32,
-        input_stall_count_at_least: u64,
     }
 
     #[derive(Deserialize)]
@@ -649,19 +526,24 @@ mod tests {
         #[serde(rename = "final")]
         is_final: bool,
         stages: serde_json::Map<String, serde_json::Value>,
-        counters: serde_json::Map<String, serde_json::Value>,
         dimensions: serde_json::Map<String, serde_json::Value>,
     }
 
+    const RAW_CONTRACT: &str = include_str!("../../../../contracts/petal-contracts.json");
+
     fn fixture() -> Fixture {
-        let raw = include_str!("../../../../contracts/petal-contracts.json");
-        serde_json::from_str(raw).expect("contract fixture parses")
+        serde_json::from_str(RAW_CONTRACT).expect("contract fixture parses")
     }
 
-    fn by_key<T: Copy>(all: &[T], key: fn(T) -> &'static str, wanted: &str) -> T {
-        *all.iter()
-            .find(|item| key(**item) == wanted)
-            .unwrap_or_else(|| panic!("unknown contract key {wanted}"))
+    fn summary_with(stages: Vec<(Stage, HistogramStats)>) -> Summary {
+        Summary {
+            role: RcRole::Host,
+            rc_session_id: "0".repeat(32),
+            interval_s: 60,
+            is_final: false,
+            stages,
+            dimensions: vec![],
+        }
     }
 
     #[test]
@@ -702,20 +584,11 @@ mod tests {
         let contract = fixture().summary;
         let stages: Vec<_> = Stage::ALL.iter().map(|s| s.key()).collect();
         assert_eq!(stages, contract.stages);
-        let counters: Vec<_> = Counter::ALL.iter().map(|c| c.key()).collect();
-        assert_eq!(counters, contract.counters);
-        let max_counters: Vec<_> = Counter::ALL
-            .iter()
-            .filter(|c| c.keeps_max())
-            .map(|c| c.key())
-            .collect();
-        assert_eq!(max_counters, contract.max_counters);
         let mut dimensions: Vec<_> = Dimension::ALL.iter().map(|d| d.key()).collect();
-        let contract_dimensions: Vec<_> = contract.dimensions.keys().map(String::as_str).collect();
+        assert_eq!(dimensions.len(), DIMENSION_COUNT);
         // serde_json's Map is sorted; the declared order (which the log line
         // follows) is checked against the raw contract text instead.
-        let raw = include_str!("../../../../contracts/petal-contracts.json");
-        let block = &raw[raw.find("\"remoteControlLatencySummary\"").unwrap()..];
+        let block = &RAW_CONTRACT[RAW_CONTRACT.find("\"remoteControlLatencySummary\"").unwrap()..];
         let block = &block[block.find("\"dimensions\"").unwrap()..];
         let positions: Vec<_> = dimensions
             .iter()
@@ -723,6 +596,7 @@ mod tests {
             .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "dimension order drifted");
         dimensions.sort_unstable();
+        let contract_dimensions: Vec<_> = contract.dimensions.keys().map(String::as_str).collect();
         assert_eq!(dimensions, contract_dimensions);
         for dimension in Dimension::ALL {
             let expected = &contract.dimensions[dimension.key()];
@@ -739,15 +613,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            contract.roles,
-            [RcRole::Host.key(), RcRole::Controller.key()]
-        );
+        assert!(contract.roles.iter().any(|role| role == RcRole::Host.key()));
         assert_eq!(contract.interval_ms, EMIT_INTERVAL.as_millis() as u64);
         assert_eq!(contract.final_min_samples, FINAL_MIN_SAMPLES);
         assert_eq!(contract.max_events_per_session, MAX_EVENTS_PER_SESSION);
-        assert_eq!(contract.degraded.photon_p95_above_ms, DEGRADED_PHOTON_P95_ABOVE_MS);
-        assert_eq!(contract.degraded.input_stall_count_at_least, DEGRADED_INPUT_STALLS_AT_LEAST);
         assert_eq!(contract.log_prefix, LOG_PREFIX);
     }
 
@@ -755,6 +624,7 @@ mod tests {
     fn example_summary_renders_the_contract_properties_and_log_line() {
         let example = fixture().summary.example;
         let input = example.summary;
+        assert_eq!(input.role, RcRole::Host.key());
         let stats = |value: &serde_json::Value| HistogramStats {
             p50: value["p50"].as_u64().unwrap() as u32,
             p95: value["p95"].as_u64().unwrap() as u32,
@@ -762,7 +632,7 @@ mod tests {
             n: value["n"].as_u64().unwrap() as u32,
         };
         let summary = Summary {
-            role: by_key(&[RcRole::Host, RcRole::Controller], RcRole::key, &input.role),
+            role: RcRole::Host,
             rc_session_id: input.rc_session_id,
             interval_s: input.interval_s,
             is_final: input.is_final,
@@ -771,15 +641,11 @@ mod tests {
                 .iter()
                 .filter_map(|stage| Some((*stage, stats(input.stages.get(stage.key())?))))
                 .collect(),
-            counters: input
-                .counters
+            dimensions: Dimension::ALL
                 .iter()
-                .map(|(k, v)| (by_key(Counter::ALL, Counter::key, k), v.as_u64().unwrap()))
-                .collect(),
-            dimensions: input
-                .dimensions
-                .iter()
-                .map(|(k, v)| (by_key(Dimension::ALL, Dimension::key, k), v.as_str().unwrap().to_string()))
+                .filter_map(|d| {
+                    Some((*d, input.dimensions.get(d.key())?.as_str()?.to_string()))
+                })
                 .collect(),
         };
         let properties: serde_json::Map<String, serde_json::Value> =
@@ -787,6 +653,8 @@ mod tests {
         assert_eq!(properties, example.properties);
         // The log line pins key order as well as values.
         assert_eq!(summary.log_line(), example.log_line);
+        let empty = summary_with(vec![(Stage::PhotonMs, HistogramStats { p50: 0, p95: 0, max: 0, n: 0 })]);
+        assert!(!empty.log_line().contains("photon_ms"), "an n = 0 stage is never rendered");
     }
 
     #[test]
@@ -825,29 +693,46 @@ mod tests {
 
     #[test]
     fn final_partial_needs_five_samples_and_regrant_mints_a_new_session() {
-        let aggregator = Aggregator::new(RcRole::Controller);
+        let aggregator = Aggregator::new(RcRole::Host);
         let t0 = Instant::now();
         aggregator.sync_at(true, t0);
         for ms in [1.0, 2.0, 3.0, 4.0] {
-            aggregator.record_stage(Stage::PhotonMs, ms);
+            aggregator.record_stage(Stage::ReplayCompleteMs, ms);
         }
         assert!(aggregator.sync_at(false, t0 + Duration::from_secs(5)).is_none(), "n < 5");
         aggregator.sync_at(true, t0 + Duration::from_secs(6));
         for _ in 0..5 {
-            aggregator.record_stage(Stage::PhotonMs, 9.0);
+            aggregator.record_stage(Stage::ReplayCompleteMs, 9.0);
         }
         let summary = aggregator.sync_at(false, t0 + Duration::from_secs(7)).unwrap();
-        assert_eq!(summary.role, RcRole::Controller);
         assert_eq!(summary.stages[0].1.n, 5, "the earlier session's samples are gone");
     }
 
+    /// Empty intervals must never emit or spend the 120-event cap; an
+    /// interval with samples after a run of empty ones still emits.
     #[test]
-    fn an_empty_interval_emits_nothing_and_the_cap_is_120() {
+    fn empty_intervals_never_emit_or_spend_the_cap() {
         let aggregator = Aggregator::new(RcRole::Host);
         let mut now = Instant::now();
         aggregator.sync_at(true, now);
+        assert!(aggregator.set_dimension(Dimension::WindowCodec, "h264"));
+        for _ in 0..200 {
+            now += EMIT_INTERVAL;
+            assert!(aggregator.sync_at(true, now).is_none(), "a dimension alone is not data");
+        }
+        aggregator.record_stage(Stage::ReplayInjectMs, 3.0);
         now += EMIT_INTERVAL;
-        assert!(aggregator.sync_at(true, now).is_none(), "no data, no event");
+        let summary = aggregator.sync_at(true, now).expect("200 empty intervals spent nothing");
+        assert_eq!(summary.dimensions, [(Dimension::WindowCodec, "h264".to_string())]);
+        now += EMIT_INTERVAL;
+        assert!(aggregator.sync_at(true, now).is_none(), "the next empty interval is silent again");
+    }
+
+    #[test]
+    fn a_session_caps_at_120_events_including_the_final() {
+        let aggregator = Aggregator::new(RcRole::Host);
+        let mut now = Instant::now();
+        aggregator.sync_at(true, now);
         let mut emitted = 0;
         for _ in 0..130 {
             aggregator.record_stage(Stage::ReplayInjectMs, 3.0);
@@ -864,65 +749,15 @@ mod tests {
     }
 
     #[test]
-    fn counters_sum_or_keep_max_and_dimensions_are_closed() {
+    fn dimensions_are_closed() {
         let aggregator = Aggregator::new(RcRole::Host);
-        let t0 = Instant::now();
         assert!(!aggregator.set_dimension(Dimension::WindowCodec, "h264"), "no session yet");
-        aggregator.sync_at(true, t0);
-        aggregator.add_counter(Counter::InputStallCount, 2);
-        aggregator.add_counter(Counter::InputStallCount, 3);
-        aggregator.add_counter(Counter::OffsetErrMs, 7);
-        aggregator.add_counter(Counter::OffsetErrMs, 4);
+        aggregator.sync_at(true, Instant::now());
         assert!(aggregator.set_dimension(Dimension::WindowCodec, "h264"));
         assert!(!aggregator.set_dimension(Dimension::WindowCodec, "My Codec"));
         assert!(!aggregator.set_dimension(Dimension::LkRegion, "Room Name With Spaces"));
+        assert!(!aggregator.set_dimension(Dimension::LkRegion, &"a".repeat(33)));
         assert!(aggregator.set_dimension(Dimension::LkRegion, "us-east-1"));
-        let summary = aggregator.sync_at(true, t0 + EMIT_INTERVAL).unwrap();
-        assert_eq!(
-            summary.counters,
-            [(Counter::InputStallCount, 5), (Counter::OffsetErrMs, 7)]
-        );
-        assert_eq!(
-            summary.dimensions,
-            [
-                (Dimension::LkRegion, "us-east-1".to_string()),
-                (Dimension::WindowCodec, "h264".to_string())
-            ]
-        );
-        assert!(summary.is_degraded(), "5 stalls trips the threshold");
-        let next = aggregator.sync_at(true, t0 + EMIT_INTERVAL * 2).unwrap();
-        assert_eq!(
-            next.counters,
-            [(Counter::InputStallCount, 0), (Counter::OffsetErrMs, 0)],
-            "a reported counter resets to 0, it does not vanish"
-        );
-        assert!(!next.is_degraded());
-    }
-
-    #[test]
-    fn degraded_threshold_in_both_directions_and_dominant_stage() {
-        let stats = |p50, p95| HistogramStats { p50, p95, max: p95, n: 10 };
-        let mut summary = Summary {
-            role: RcRole::Controller,
-            rc_session_id: "0".repeat(32),
-            interval_s: 60,
-            is_final: false,
-            stages: vec![
-                (Stage::InputLegMs, stats(12, 30)),
-                (Stage::JbDelayMs, stats(80, 120)),
-                (Stage::PhotonMs, stats(300, 400)),
-            ],
-            counters: vec![(Counter::InputStallCount, 4)],
-            dimensions: vec![],
-        };
-        assert!(!summary.is_degraded(), "p95 400 is not above 400; 4 stalls is under 5");
-        assert_eq!(summary.dominant_stage(), Some(Stage::JbDelayMs), "photon never dominates");
-        summary.stages[2].1.p95 = 401;
-        assert!(summary.is_degraded());
-        summary.stages[2].1.p95 = 100;
-        summary.counters[0].1 = 5;
-        assert!(summary.is_degraded());
-        assert_eq!(summary_dimension_or_unknown(&summary, Dimension::SameEdge), "unknown");
     }
 
     #[test]
@@ -936,7 +771,6 @@ mod tests {
                 let started = Instant::now();
                 for _ in 0..1000 {
                     aggregator.record_stage(Stage::ReplayInjectMs, 1.0);
-                    aggregator.add_counter(Counter::NackCount, 1);
                 }
                 started.elapsed()
             })
@@ -944,6 +778,6 @@ mod tests {
         let elapsed = worker.join().unwrap();
         drop(guard);
         assert!(elapsed < Duration::from_secs(1), "record_stage waited on the lock");
-        assert_eq!(aggregator.contended_drops(), 2000);
+        assert_eq!(aggregator.contended_drops(), 1000);
     }
 }
