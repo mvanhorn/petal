@@ -21450,38 +21450,54 @@ mod tests {
         let ids = remote_control_test_ids(
             "replay_one_task_records_host_replay_stages_from_the_receive_instant",
         );
-        rc_latency_telemetry::sync(RcRole::Host, true);
-        let mut task = replay_task(
-            test_message(
-                RemoteControlType::Key,
-                Some(RemoteControlAction::Down),
-                1,
-                ids.window_id,
-                ids.controller_id,
-            ),
-            frame(0, 0, 100, 100),
-            Some(1234),
-            false,
-        );
-        task.received_at = Some(Instant::now() - Duration::from_millis(80));
-        let inject = test_injector(|_message, _frame, _target_pid| {
-            std::thread::sleep(Duration::from_millis(30));
-            Ok(())
-        });
-        replay_one_task(task, &inject);
-        let summary = rc_latency_telemetry::take_host_interval_for_test()
-            .expect("an active host session with samples emits an interval");
-        let max_of = |wanted: Stage| {
-            summary
-                .stages
-                .iter()
-                .find(|(stage, _)| *stage == wanted)
-                .map(|(_, stats)| stats.max)
-                .unwrap_or_else(|| panic!("{} missing from {summary:?}", wanted.key()))
-        };
-        assert!(max_of(Stage::ReplayInjectMs) >= 75, "{summary:?}");
-        assert!(max_of(Stage::ReplayCompleteMs) >= 105, "{summary:?}");
-        assert!(summary.log_line().starts_with("remote-control-latency-summary: role=host "));
+        let _guard = platform_input_test_lock();
+        // record_stage drops a sample when another test thread briefly holds
+        // the global host lock (the designed hot-path behaviour), so retry.
+        let mut inject_max = 0;
+        let mut complete_max = 0;
+        let mut line = String::new();
+        for seq in 1..=5u64 {
+            rc_latency_telemetry::sync(RcRole::Host, true);
+            let mut task = replay_task(
+                test_message(
+                    RemoteControlType::Key,
+                    Some(RemoteControlAction::Down),
+                    seq,
+                    ids.window_id,
+                    ids.controller_id.clone(),
+                ),
+                frame(0, 0, 100, 100),
+                // Unique pid: a shared one (1234) is held busy for 5 s by
+                // the injection-timeout test and the replay is refused.
+                Some(ids.window_id as i32),
+                false,
+            );
+            task.received_at = Some(Instant::now() - Duration::from_millis(80));
+            let inject = test_injector(|_message, _frame, _target_pid| {
+                std::thread::sleep(Duration::from_millis(30));
+                Ok(())
+            });
+            replay_one_task(task, &inject);
+            let Some(summary) = rc_latency_telemetry::take_host_interval_for_test() else {
+                continue;
+            };
+            let max_of = |wanted: Stage| {
+                summary
+                    .stages
+                    .iter()
+                    .find(|(stage, _)| *stage == wanted)
+                    .map_or(0, |(_, stats)| stats.max)
+            };
+            inject_max = inject_max.max(max_of(Stage::ReplayInjectMs));
+            complete_max = complete_max.max(max_of(Stage::ReplayCompleteMs));
+            line = summary.log_line();
+            if inject_max >= 75 && complete_max >= 105 {
+                break;
+            }
+        }
+        assert!(inject_max >= 75, "replay_inject_ms max {inject_max}");
+        assert!(complete_max >= 105, "replay_complete_ms max {complete_max}");
+        assert!(line.starts_with("remote-control-latency-summary: role=host "));
     }
 
     #[test]
