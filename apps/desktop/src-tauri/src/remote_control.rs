@@ -27,6 +27,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::platform::cg::WindowFrame;
 use crate::remote_clipboard;
+use crate::rc_latency_telemetry::{self, Dimension, RcRole, Stage};
 use crate::session::{RoomGeneration, SessionState, SharedWindowScreenStatus};
 use crate::transport::publisher::RoomConnection;
 
@@ -256,6 +257,8 @@ struct ResolveTask {
     local_identity: String,
     admission: Option<DiscreteAdmission>,
     result_sender: Option<TerminalResultSender>,
+    /// #370: host receive instant, carried to replay for the latency summary.
+    received_at: Option<Instant>,
 }
 
 /// Best-effort correlation for an invalid v2 envelope. We only emit a terminal
@@ -898,6 +901,23 @@ fn hot_path_capable_targets() -> &'static Mutex<HashSet<(u32, String)>> {
     remote_control_engine().hot_path_capable_targets()
 }
 
+/// #370: (window, host) pairs this process is currently controlling, from
+/// the host's own active/stopped status. Drives the controller-side latency
+/// session; cleared on leave by `revoke_all`.
+fn controller_active_targets() -> &'static Mutex<HashSet<(u32, String)>> {
+    static TARGETS: OnceLock<Mutex<HashSet<(u32, String)>>> = OnceLock::new();
+    TARGETS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn note_controller_control_active(window_id: u32, host_identity: &str, active: bool) {
+    let mut targets = controller_active_targets().lock_unpoisoned();
+    if active {
+        targets.insert((window_id, host_identity.to_string()));
+    } else {
+        targets.remove(&(window_id, host_identity.to_string()));
+    }
+}
+
 fn new_grant_token() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable for remote-control grant token");
@@ -1436,6 +1456,12 @@ fn ensure_pressed_ttl_sweeper() {
             std::thread::sleep(HELD_INPUT_SWEEP_INTERVAL);
             let releases = drain_expired_pressed(Instant::now());
             enqueue_synthetic_releases(releases, "held input TTL expired");
+            // #370: reconcile both latency-summary sessions with the live
+            // grant state (authority, not event order) and emit due intervals.
+            let hosting = !sessions().lock_unpoisoned().is_empty();
+            rc_latency_telemetry::sync(RcRole::Host, hosting);
+            let controlling = !controller_active_targets().lock_unpoisoned().is_empty();
+            rc_latency_telemetry::sync(RcRole::Controller, controlling);
             ticks_since_summary += 1;
             if ticks_since_summary >= LATENCY_SUMMARY_TICK_INTERVAL {
                 ticks_since_summary = 0;
@@ -1536,6 +1562,12 @@ fn authorize_shared_key(key: ControlGrantKey) -> String {
     let controller_id = key.controller_id.clone();
     let grant_token = new_grant_token();
     remote_control_engine().install_grant(key, grant_token.clone());
+    rc_latency_telemetry::sync(RcRole::Host, true);
+    rc_latency_telemetry::set_dimension(
+        RcRole::Host,
+        Dimension::WindowCodec,
+        crate::transport::publisher::window_codec_label(),
+    );
     warned_tokenless_inputs()
         .lock_unpoisoned()
         .remove(&(window_id, controller_id.clone()));
@@ -1749,6 +1781,8 @@ pub(crate) fn revoke_all(app: &AppHandle) {
     warned_controller_id_mismatches().lock_unpoisoned().clear();
     // Refs #288: same insert-only leak class as the maps above.
     *discrete_admissions().lock_unpoisoned() = DiscreteAdmissionState::default();
+    // #370: leaving the room ends any controller-side latency session too.
+    controller_active_targets().lock_unpoisoned().clear();
     for (window_id, controller_id) in active {
         emit_status(
             app,
@@ -3263,6 +3297,14 @@ fn replay_one_task(task: ReplayTask, inject: &ReplayInjector) {
     }
     let started = Instant::now();
     let inject_started_ms = now_ms();
+    // #370: every real input feeds the summary; the log lines stay sampled.
+    if let Some(received_at) = task.received_at {
+        rc_latency_telemetry::record_stage(
+            RcRole::Host,
+            Stage::ReplayInjectMs,
+            started.saturating_duration_since(received_at).as_secs_f64() * 1000.0,
+        );
+    }
     if should_log_latency_probe(&task.message) {
         log::info!(
             "remote-control-latency: host inject_ts_ms={} {} target_pid={:?}",
@@ -3279,6 +3321,13 @@ fn replay_one_task(task: ReplayTask, inject: &ReplayInjector) {
             crate::session::note_remote_interaction(task.message.window_id, task.message.seq);
             let elapsed_ms = started.elapsed().as_millis() as u64;
             record_latency_summary_success(elapsed_ms);
+            if let Some(received_at) = task.received_at {
+                rc_latency_telemetry::record_stage(
+                    RcRole::Host,
+                    Stage::ReplayCompleteMs,
+                    received_at.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
             if should_log_latency_probe(&task.message) {
                 log::info!(
                     "remote-control-latency: host replay complete_ts_ms={} {} elapsed_ms={} target_pid={:?}",
@@ -4110,6 +4159,7 @@ fn resolve_one_task(app: &AppHandle, task: ResolveTask) {
     let state = state.inner();
     let admission = task.admission.clone();
     let result_sender = task.result_sender.clone();
+    let received_at = task.received_at;
     let mut message = task.message;
     let local_identity = task.local_identity.clone();
     let frame = match fresh_control_frame(state, message.window_id) {
@@ -4318,7 +4368,7 @@ fn resolve_one_task(app: &AppHandle, task: ResolveTask) {
     // The #209 cache here has pid/frame freshness, not z-order/occlusion;
     // confirming frontmost-at-point would require a per-event CG scan.
     publish_control_activity(state, &message);
-    commit_resolved_input(message, frame, target_pid, admission, result_sender);
+    commit_resolved_input(message, frame, target_pid, admission, result_sender, received_at);
 }
 
 /// The resolver's last step: record the input as held, then queue its replay.
@@ -4329,6 +4379,7 @@ fn commit_resolved_input(
     target_pid: i32,
     admission: Option<DiscreteAdmission>,
     result_sender: Option<TerminalResultSender>,
+    received_at: Option<Instant>,
 ) -> bool {
     // #365: re-check auth, track and enqueue under the fence every grant
     // removal drains under. Checking only at the top of `resolve_one_task`
@@ -4373,6 +4424,7 @@ fn commit_resolved_input(
     let mut replay = replay_task(message, frame, Some(target_pid), false);
     replay.admission = admission;
     replay.result_sender = result_sender;
+    replay.received_at = received_at;
     enqueue_replay(replay);
     true
 }
@@ -4514,6 +4566,7 @@ fn handle_message(
             message.controller_id
         );
     }
+    let received_at = Instant::now();
     if should_log_latency_probe(&message) {
         log::info!(
             "remote-control-latency: host receive_ts_ms={} {}",
@@ -4579,6 +4632,7 @@ fn handle_message(
             #[cfg(not(target_os = "windows"))]
             let overlay_active = Some(status == "active");
             if let Some(active) = overlay_active {
+                note_controller_control_active(message.window_id, &message.controller_id, active);
                 if let Err(e) = set_remote_window_control_active(
                     app,
                     message.window_id,
@@ -4988,6 +5042,7 @@ fn handle_message(
                                     local_identity: local_identity.to_string(),
                                 },
                             ),
+                            received_at: Some(received_at),
                         },
                     )
                 }
@@ -19679,6 +19734,7 @@ mod tests {
             admission: Some(enqueued_admission.clone()),
             terminal_on_success: true,
             result_sender: None,
+            received_at: None,
         };
         // Refs #288: `push_replay`/`ReplayQueuePush` no longer exist -- #369
         // replaced the single global replay queue with per-target-pid shards
@@ -21133,6 +21189,7 @@ mod tests {
             local_identity: "host".to_string(),
             admission: None,
             result_sender: None,
+            received_at: None,
         };
         let second_move = ResolveTask {
             message: test_message(
@@ -21145,6 +21202,7 @@ mod tests {
             local_identity: "host".to_string(),
             admission: None,
             result_sender: None,
+            received_at: None,
         };
         let key_down = ResolveTask {
             message: test_message(
@@ -21157,6 +21215,7 @@ mod tests {
             local_identity: "host".to_string(),
             admission: None,
             result_sender: None,
+            received_at: None,
         };
 
         assert!(matches!(queue.push(first_move), ResolveQueuePush::Enqueued));
@@ -21382,6 +21441,47 @@ mod tests {
             started.elapsed()
                 < Duration::from_millis(REPLAY_EVENT_DEADLINE.as_millis() as u64 + 400)
         );
+    }
+
+    /// #370: the real replay path feeds the host latency summary from the
+    /// receive instant the task carries (receive -> inject, receive -> complete).
+    #[test]
+    fn replay_one_task_records_host_replay_stages_from_the_receive_instant() {
+        let ids = remote_control_test_ids(
+            "replay_one_task_records_host_replay_stages_from_the_receive_instant",
+        );
+        rc_latency_telemetry::sync(RcRole::Host, true);
+        let mut task = replay_task(
+            test_message(
+                RemoteControlType::Key,
+                Some(RemoteControlAction::Down),
+                1,
+                ids.window_id,
+                ids.controller_id,
+            ),
+            frame(0, 0, 100, 100),
+            Some(1234),
+            false,
+        );
+        task.received_at = Some(Instant::now() - Duration::from_millis(80));
+        let inject = test_injector(|_message, _frame, _target_pid| {
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(())
+        });
+        replay_one_task(task, &inject);
+        let summary = rc_latency_telemetry::take_host_interval_for_test()
+            .expect("an active host session with samples emits an interval");
+        let max_of = |wanted: Stage| {
+            summary
+                .stages
+                .iter()
+                .find(|(stage, _)| *stage == wanted)
+                .map(|(_, stats)| stats.max)
+                .unwrap_or_else(|| panic!("{} missing from {summary:?}", wanted.key()))
+        };
+        assert!(max_of(Stage::ReplayInjectMs) >= 75, "{summary:?}");
+        assert!(max_of(Stage::ReplayCompleteMs) >= 105, "{summary:?}");
+        assert!(summary.log_line().starts_with("remote-control-latency-summary: role=host "));
     }
 
     #[test]
@@ -22114,7 +22214,7 @@ mod tests {
     /// AppHandle-bound frame/pid lookup that runs between them.
     fn issue365_resolve(message: RemoteControlMessage) {
         if resolve_task_still_authorized(&message) {
-            let _ = commit_resolved_input(message, frame(0, 0, 100, 100), ISSUE365_PID, None, None);
+            let _ = commit_resolved_input(message, frame(0, 0, 100, 100), ISSUE365_PID, None, None, None);
         }
     }
 
@@ -22131,7 +22231,7 @@ mod tests {
         // ...the controller's Release is then handled inline on the receive path...
         revoke(ids.window_id, &ids.controller_id);
         // ...before the resolver records and queues Down 12, then pops Up 13.
-        let _ = commit_resolved_input(down, frame(0, 0, 100, 100), ISSUE365_PID, None, None);
+        let _ = commit_resolved_input(down, frame(0, 0, 100, 100), ISSUE365_PID, None, None, None);
         issue365_resolve(up);
 
         sink.assert_no_stranded_down();
@@ -22245,7 +22345,7 @@ mod tests {
             });
         }
 
-        assert!(commit_resolved_input(down, frame(0, 0, 100, 100), ISSUE365_PID, None, None));
+        assert!(commit_resolved_input(down, frame(0, 0, 100, 100), ISSUE365_PID, None, None, None));
         let handle = revoker.lock_unpoisoned().take().expect("commit hook ran");
         handle.join().expect("revoke thread");
 
@@ -23330,6 +23430,7 @@ mod tests {
             local_identity: "host-id".to_string(),
             admission: None,
             result_sender: None,
+            received_at: None,
         };
 
         assert!(!resolve_task_still_authorized(&task.message));

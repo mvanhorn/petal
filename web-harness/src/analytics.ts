@@ -11,6 +11,8 @@
 // exception capture stay locked off). Never send room names, identities,
 // window titles, device names, key codes, clipboard, coordinates, or tokens.
 
+import { rcLatencySummaryProperties, type RcLatencySummary } from '@petal/shared/logic/rcLatencyAggregator';
+
 declare const __PETAL_BUILD_INFO__: { version: string } | undefined;
 
 const DEFAULT_HOST = 'https://us.i.posthog.com';
@@ -37,6 +39,9 @@ export const EVENT_NAMES = [
   'permission_denied',
   'remote_control_input',
   'device_changed',
+  // #370: one per 60 s of active remote control; integer-ms percentiles are
+  // the allowlist's scoped exception to "buckets, never raw ms".
+  'remote_control_latency_summary',
 ] as const;
 
 export type EventName = (typeof EVENT_NAMES)[number];
@@ -53,9 +58,11 @@ export type RemoteControlInputKind = 'click' | 'type' | 'paste' | 'scroll';
 export type DeviceKind = 'display' | 'camera' | 'mic';
 export type DeviceChange = 'switched' | 'failed' | 'reconfigured' | 'sleep' | 'wake';
 
+export type PropertyValue = string | number | boolean;
+
 export type CapturedEvent = {
   name: EventName;
-  properties: Record<string, string>;
+  properties: Record<string, PropertyValue>;
 };
 
 type ViteImportMeta = ImportMeta & {
@@ -90,7 +97,7 @@ export type RemoteControlLike = {
 
 type EventSpec = {
   name: EventName;
-  extras: Record<string, string>;
+  extras: Record<string, PropertyValue>;
 };
 
 const COMMON_KEYS = ['build_version', 'os', 'os_version', 'arch', 'client'] as const;
@@ -102,6 +109,7 @@ let keylessLogged = false;
 let lastDisplayReconfigAt = 0;
 let testSink: CapturedEvent[] | null = null;
 let pagehideInstalled = false;
+let testConsent: boolean | null = null;
 
 const videoStalls = new Map<string, VideoStallState>();
 const audioSilences = new Map<string, AudioSilenceState>();
@@ -275,7 +283,7 @@ export function inMeeting(): boolean {
   return meeting !== null;
 }
 
-function extrasFor(spec: EventSpec): Record<string, string> {
+function extrasFor(spec: EventSpec): Record<string, PropertyValue> {
   return { ...commonProperties(), ...spec.extras };
 }
 
@@ -302,7 +310,23 @@ function send(body: Record<string, unknown>): void {
   }
 }
 
+/**
+ * THE single consent check for every PostHog send (web). #377 points this at
+ * its usage-stats toggle; until then it is always true (default on, matching
+ * Sentry). Do not add a second check elsewhere (#370/#377).
+ */
+export function usageStatsConsented(): boolean {
+  if (testConsent !== null) return testConsent;
+  return true;
+}
+
+/** Test-only override of `usageStatsConsented` (null restores the real check). */
+export function setUsageStatsConsentForTest(value: boolean | null): void {
+  testConsent = value;
+}
+
 function capture(spec: EventSpec): void {
+  if (!usageStatsConsented()) return;
   const properties = extrasFor(spec);
   if (testSink) {
     testSink.push({ name: spec.name, properties });
@@ -405,6 +429,11 @@ export function reconnectFailed(): void {
 
 export function permissionDenied(kind: PermissionKind): void {
   capture({ name: 'permission_denied', extras: { kind } });
+}
+
+/** #370: one per-interval remote-control latency summary. Never per input. */
+export function remoteControlLatencySummary(summary: RcLatencySummary): void {
+  capture({ name: 'remote_control_latency_summary', extras: rcLatencySummaryProperties(summary) });
 }
 
 export function deviceChanged(kind: DeviceKind, change: DeviceChange): void {
@@ -578,6 +607,7 @@ export function installTestSink(): CapturedEvent[] {
 
 export function uninstallTestSink(): void {
   testSink = null;
+  testConsent = null;
   resetAnalyticsState();
 }
 

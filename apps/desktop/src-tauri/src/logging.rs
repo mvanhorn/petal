@@ -258,6 +258,39 @@ pub enum SentryDiagnosticEvent {
     PointerReleaseNotInjected(PointerReleaseNotInjectedDiagnostic),
     WgcBorderRequestFailed(WgcBorderRequestFailedDiagnostic),
     RemoteVideoStalled(RemoteVideoStalledDiagnostic),
+    RemoteControlLatencyDegraded(RemoteControlLatencyDegradedDiagnostic),
+}
+
+/// #370: one remote-control latency interval crossed #369's degraded line
+/// (`photon_ms_p95 > 400` or `input_stall_count >= 5`). Closed tags only;
+/// the numbers themselves live in PostHog's `remote_control_latency_summary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteControlLatencyDegradedDiagnostic {
+    pub(crate) role: crate::rc_latency_telemetry::RcRole,
+    pub(crate) dominant_stage: Option<crate::rc_latency_telemetry::Stage>,
+    pub(crate) same_edge: &'static str,
+    pub(crate) ice_candidate_type: &'static str,
+}
+
+impl RemoteControlLatencyDegradedDiagnostic {
+    pub(crate) fn from_summary(summary: &crate::rc_latency_telemetry::Summary) -> Self {
+        use crate::rc_latency_telemetry::{summary_dimension_or_unknown, Dimension};
+        // Re-borrow each value from the closed allowed-value list so the tag
+        // is `&'static` and can never carry a producer-supplied string.
+        let closed = |dimension: Dimension| {
+            let value = summary_dimension_or_unknown(summary, dimension);
+            dimension
+                .allowed_values()
+                .and_then(|allowed| allowed.iter().find(|v| **v == value).copied())
+                .unwrap_or("unknown")
+        };
+        Self {
+            role: summary.role,
+            dominant_stage: summary.dominant_stage(),
+            same_edge: closed(Dimension::SameEdge),
+            ice_candidate_type: closed(Dimension::IceCandidateType),
+        }
+    }
 }
 
 /// Emitted (rate-limited) when a remote-control pointer RELEASE (an Up) fails
@@ -635,7 +668,7 @@ diagnostic_enum!(SinceLastFrameBucketTag {
 
 const SENTRY_DIAGNOSTIC_SCHEMA_VERSION: &str = "1";
 const SENTRY_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(60);
-const DIAGNOSTIC_EVENT_NAMES: [&str; 19] = [
+const DIAGNOSTIC_EVENT_NAMES: [&str; 20] = [
     "capture-layout-invalid",
     "camera-health",
     "camera-size-mismatch-recovery",
@@ -655,6 +688,7 @@ const DIAGNOSTIC_EVENT_NAMES: [&str; 19] = [
     "pointer-release-not-injected",
     "wgc-border-request-failed",
     "remote-video-stalled",
+    "remote-control-latency-degraded",
 ];
 const DIAGNOSTIC_TAGS: &[&str] = &[
     "event_name",
@@ -696,7 +730,19 @@ const DIAGNOSTIC_TAGS: &[&str] = &[
     "remote_video_hold_reason",
     "probe_failure_bucket",
     "since_last_frame_bucket",
+    "rc_role",
+    "rc_dominant_stage",
+    "rc_same_edge",
+    "rc_ice_candidate_type",
     "dedup_count_bucket",
+];
+/// #370: set only by `remote-control-latency-degraded`; every other
+/// diagnostic reports them `not_applicable` (fail-closed tag count).
+const RC_LATENCY_TAGS: &[&str] = &[
+    "rc_role",
+    "rc_dominant_stage",
+    "rc_same_edge",
+    "rc_ice_candidate_type",
 ];
 
 const CAPTURE_LAYOUT_MESSAGE_TAGS: &[&str] = &[
@@ -736,6 +782,7 @@ const REMOTE_VIDEO_STALLED_MESSAGE_TAGS: &[&str] = &[
     "probe_failure_bucket",
     "since_last_frame_bucket",
 ];
+const REMOTE_CONTROL_LATENCY_DEGRADED_MESSAGE_TAGS: &[&str] = RC_LATENCY_TAGS;
 const CAMERA_SIZE_MISMATCH_MESSAGE_TAGS: &[&str] = &[
     "session_role",
     "camera_direction",
@@ -779,6 +826,7 @@ fn diagnostic_message_tags(event_name: &str) -> Option<&'static [&'static str]> 
         "pointer-release-not-injected" => Some(POINTER_RELEASE_NOT_INJECTED_MESSAGE_TAGS),
         "wgc-border-request-failed" => Some(WGC_BORDER_REQUEST_FAILED_MESSAGE_TAGS),
         "remote-video-stalled" => Some(REMOTE_VIDEO_STALLED_MESSAGE_TAGS),
+        "remote-control-latency-degraded" => Some(REMOTE_CONTROL_LATENCY_DEGRADED_MESSAGE_TAGS),
         _ => None,
     }
 }
@@ -1127,6 +1175,7 @@ impl SentryDiagnosticEvent {
             Self::PointerReleaseNotInjected(_) => "pointer-release-not-injected",
             Self::WgcBorderRequestFailed(_) => "wgc-border-request-failed",
             Self::RemoteVideoStalled(_) => "remote-video-stalled",
+            Self::RemoteControlLatencyDegraded(_) => "remote-control-latency-degraded",
         }
     }
 }
@@ -1836,8 +1885,55 @@ fn build_sentry_diagnostic_event(
             insert("probe_failure_bucket", value.probe_failures.tag());
             insert("since_last_frame_bucket", value.since_last_frame.tag());
         }
+        SentryDiagnosticEvent::RemoteControlLatencyDegraded(value) => {
+            insert("session_role", "not_applicable");
+            insert("source_selection", "not_applicable");
+            insert("capture_geometry", "not_applicable");
+            insert("configured_geometry", "not_applicable");
+            insert("pixel_format", "not_applicable");
+            insert("scale_bucket", "not_applicable");
+            insert("encoder_implementation", "not_applicable");
+            insert("stage_code", "not_applicable");
+            insert("camera_direction", "not_applicable");
+            insert("capture_cadence", "not_applicable");
+            insert("encode_cadence", "not_applicable");
+            insert("queue_backpressure", "not_applicable");
+            insert("decoder_render_health", "not_applicable");
+            insert("stall_cause", "not_applicable");
+            insert("recovery_action", "not_applicable");
+            insert("playout_transition", "not_applicable");
+            insert("storm_scope", "not_applicable");
+            insert("install_failure_stage", "not_applicable");
+            insert("install_failure_kind", "not_applicable");
+            insert("install_volume_boundary", "not_applicable");
+            insert("install_destination_class", "not_applicable");
+            insert("overlay_clear_reason", "not_applicable");
+            insert("crash_report_status", "not_applicable");
+            insert("pressure_level", "not_applicable");
+            insert("browser_url_extraction_cause", "not_applicable");
+            insert("descriptor_pressure_stage", "not_applicable");
+            insert("pointer_button", "not_applicable");
+            insert("pointer_release_failure_cause", "not_applicable");
+            insert("memory_top_owner", "not_applicable");
+            insert("wgc_border_failure", "not_applicable");
+            insert("sharer_kind", "not_applicable");
+            insert("remote_video_hold_reason", "not_applicable");
+            insert("probe_failure_bucket", "not_applicable");
+            insert("since_last_frame_bucket", "not_applicable");
+            insert("rc_role", value.role.key());
+            insert(
+                "rc_dominant_stage",
+                value.dominant_stage.map(crate::rc_latency_telemetry::Stage::key).unwrap_or("none"),
+            );
+            insert("rc_same_edge", value.same_edge);
+            insert("rc_ice_candidate_type", value.ice_candidate_type);
+        }
     }
     insert("dedup_count_bucket", dedup_count_bucket);
+    for key in RC_LATENCY_TAGS {
+        tags.entry((*key).into())
+            .or_insert_with(|| "not_applicable".into());
+    }
     let message = diagnostic_message(&tags);
     let fingerprint = diagnostic_fingerprint(&tags);
     debug_assert_eq!(
@@ -5792,6 +5888,18 @@ fn valid_diagnostic_tag(key: &str, value: &str) -> bool {
         "since_last_frame_bucket" => matches!(
             value,
             "under_1m" | "1_5m" | "5_15m" | "over_15m" | "not_applicable"
+        ),
+        "rc_role" => matches!(value, "host" | "controller" | "not_applicable"),
+        "rc_dominant_stage" => {
+            matches!(value, "none" | "not_applicable")
+                || crate::rc_latency_telemetry::Stage::ALL
+                    .iter()
+                    .any(|stage| stage.key() == value)
+        }
+        "rc_same_edge" => matches!(value, "true" | "false" | "unknown" | "not_applicable"),
+        "rc_ice_candidate_type" => matches!(
+            value,
+            "host" | "srflx" | "prflx" | "relay" | "unknown" | "not_applicable"
         ),
         _ => false,
     }
@@ -9881,6 +9989,86 @@ mod tests {
             )
         });
         assert_eq!(keys, ["browser_url_extraction_cause"]);
+    }
+
+    fn degraded_summary(
+        photon_p95: u32,
+        stalls: u64,
+    ) -> crate::rc_latency_telemetry::Summary {
+        use crate::rc_latency_telemetry::{Counter, Dimension, HistogramStats, RcRole, Stage, Summary};
+        let stats = |p50, p95| HistogramStats { p50, p95, max: p95, n: 30 };
+        Summary {
+            role: RcRole::Controller,
+            rc_session_id: "c".repeat(32),
+            interval_s: 60,
+            is_final: false,
+            stages: vec![
+                (Stage::InputLegMs, stats(9, 20)),
+                (Stage::JbDelayMs, stats(70, 90)),
+                (Stage::PhotonMs, stats(250, photon_p95)),
+            ],
+            counters: vec![(Counter::InputStallCount, stalls)],
+            dimensions: vec![
+                (Dimension::SameEdge, "false".to_string()),
+                (Dimension::IceCandidateType, "relay".to_string()),
+            ],
+        }
+    }
+
+    /// #370: the degraded diagnostic carries only closed tags, survives the
+    /// real before_send validator, and is rate-limited like every other class.
+    #[test]
+    fn remote_control_latency_degraded_is_closed_valid_and_rate_limited() {
+        assert!(!degraded_summary(400, 4).is_degraded());
+        let summary = degraded_summary(401, 0);
+        assert!(summary.is_degraded());
+        let diagnostic = RemoteControlLatencyDegradedDiagnostic::from_summary(&summary);
+        let event = build_sentry_diagnostic_event(
+            SentryDiagnosticEvent::RemoteControlLatencyDegraded(diagnostic),
+            "1",
+        );
+        assert_eq!(event.tags.len(), DIAGNOSTIC_TAGS.len());
+        assert_eq!(event.tags.get("rc_role").map(String::as_str), Some("controller"));
+        assert_eq!(event.tags.get("rc_dominant_stage").map(String::as_str), Some("jb_delay_ms"));
+        assert_eq!(event.tags.get("rc_same_edge").map(String::as_str), Some("false"));
+        assert_eq!(event.tags.get("rc_ice_candidate_type").map(String::as_str), Some("relay"));
+        assert_eq!(
+            event.message.as_deref(),
+            Some(
+                "diagnostic: remote-control-latency-degraded rc_role=controller \
+                 rc_dominant_stage=jb_delay_ms rc_same_edge=false rc_ice_candidate_type=relay"
+            )
+        );
+        assert!(valid_sentry_diagnostic_event(&event));
+        assert!(scrub_event_for_sentry(event).is_some());
+
+        let mut bad = build_sentry_diagnostic_event(
+            SentryDiagnosticEvent::RemoteControlLatencyDegraded(diagnostic),
+            "1",
+        );
+        bad.tags.insert("rc_dominant_stage".into(), "room-name".into());
+        assert!(!valid_sentry_diagnostic_event(&bad), "an open-ended stage value must be refused");
+
+        let mut limiter = DiagnosticRateLimiter::default();
+        let now = std::time::Instant::now();
+        assert!(limiter.allow("remote-control-latency-degraded", now).is_some());
+        assert!(limiter
+            .allow("remote-control-latency-degraded", now + Duration::from_secs(30))
+            .is_none());
+        assert!(limiter
+            .allow("remote-control-latency-degraded", now + Duration::from_secs(61))
+            .is_some());
+
+        let other = build_sentry_diagnostic_event(
+            SentryDiagnosticEvent::DescriptorPressure(DescriptorPressureDiagnostic {
+                stage: DescriptorPressureStageTag::Exhausted,
+            }),
+            "1",
+        );
+        for key in RC_LATENCY_TAGS {
+            assert_eq!(other.tags.get(*key).map(String::as_str), Some("not_applicable"));
+        }
+        assert!(valid_sentry_diagnostic_event(&other));
     }
 
     #[test]
