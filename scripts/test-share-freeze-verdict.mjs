@@ -141,7 +141,11 @@ test('a correlated freeze next to a silent-SCK line on the sharer is attributed 
 test('the induced red-proof pause is named as such', () => {
   const hole = [[60_000, 62_000]];
   const log = logLine(T0 + 20_000 + 60_000, 'TEST share pause: dropping every window-share frame for 2000ms (PETAL_TEST_SHARE_PAUSE, red proof only)');
-  const v = freezeVerdict({ raw: soak({ holes: { 'freeze-viewer-1': hole, 'freeze-viewer-2': hole } }), senderLogText: log });
+  // Run 39838539435: both renderers also lagged ~315ms as frames resumed.
+  const lagAt = T0 + 20_000 + 60_000;
+  const raw = soak({ holes: { 'freeze-viewer-1': hole, 'freeze-viewer-2': hole }, lag: { 'freeze-viewer-1': [[lagAt, 319]], 'freeze-viewer-2': [[lagAt, 313]] } });
+  const v = freezeVerdict({ raw, senderLogText: log });
+  assert.equal(v.outcome, 'fail');
   assert.match(v.report.clusters[0].attribution, /induced PETAL_TEST_SHARE_PAUSE/);
 });
 
@@ -179,17 +183,50 @@ test('a gap where the SOURCE stopped repainting is not counted as a freeze', () 
   assert.match(v.warnings.join('\n'), /NOT counted: the source itself did not repaint/);
 });
 
-test('a correlated freeze where every viewer page stalled is flagged as a host VM stall', () => {
-  const hole = [[70_000, 71_000]];
-  const lagAt = T0 + 20_000 + 70_100;
+test('fixture AND every viewer page stalling together is a host-VM stall: reported, not counted', () => {
+  // Run 39838535897's shape: fixture repaint gap 327ms, renderers 329/639ms.
+  const rel = 70_000;
+  const lagAt = T0 + 20_000 + rel;
+  const raw = soak({
+    holes: { 'freeze-viewer-1': [[rel, rel + 950]], 'freeze-viewer-2': [[rel, rel + 1000]] },
+    sourceHoles: [[rel + 300, rel + 627]],
+    lag: { 'freeze-viewer-1': [[lagAt, 329]], 'freeze-viewer-2': [[lagAt, 639]] },
+  });
+  const v = freezeVerdict({ raw });
+  assert.equal(v.outcome, 'pass', v.errors.join('\n'));
+  assert.equal(v.report.hostVmStalls, 1);
+  assert.match(v.report.clusters[0].attribution, /^host-vm-stall/);
+  assert.match(v.warnings.join('\n'), /NOT counted: all-viewers gap/);
+});
+
+test('renderer lag alone (source kept repainting) never excuses a correlated freeze', () => {
+  const rel = 70_000;
+  const lagAt = T0 + 20_000 + rel;
   const v = freezeVerdict({
     raw: soak({
-      holes: { 'freeze-viewer-1': hole, 'freeze-viewer-2': hole },
-      lag: { 'freeze-viewer-1': [[lagAt, 800]], 'freeze-viewer-2': [[lagAt, 750]] },
+      holes: { 'freeze-viewer-1': [[rel, rel + 2000]], 'freeze-viewer-2': [[rel, rel + 2000]] },
+      lag: { 'freeze-viewer-1': [[lagAt, 319]], 'freeze-viewer-2': [[lagAt, 313]] },
     }),
   });
   assert.equal(v.outcome, 'fail');
-  assert.match(v.report.clusters[0].attribution, /^host-vm-stall/);
+  assert.equal(v.report.clusters[0].counted, true);
+  assert.match(v.report.clusters[0].attribution, /^sender-or-sfu/);
+});
+
+test('more than two host-VM stalls in a window is INFRA-INVALID', () => {
+  const holes = { 'freeze-viewer-1': [], 'freeze-viewer-2': [] };
+  const sourceHoles = [];
+  const lag = { 'freeze-viewer-1': [], 'freeze-viewer-2': [] };
+  for (const rel of [20_000, 50_000, 80_000]) {
+    holes['freeze-viewer-1'].push([rel, rel + 900]);
+    holes['freeze-viewer-2'].push([rel, rel + 900]);
+    sourceHoles.push([rel + 300, rel + 600]);
+    lag['freeze-viewer-1'].push([T0 + 20_000 + rel, 400]);
+    lag['freeze-viewer-2'].push([T0 + 20_000 + rel, 400]);
+  }
+  const v = freezeVerdict({ raw: soak({ holes, sourceHoles, lag }) });
+  assert.equal(v.outcome, 'infra-invalid');
+  assert.match(v.errors[0], /too noisy/);
 });
 
 test('the sharer dying is a FREEZE failure, not infra', () => {
